@@ -32,12 +32,20 @@
 #define JETSON_TIMEOUT_MS   2000
 
 /* --- State Machine Enums --- */
-typedef enum { SCREEN_MAIN_MENU=0, SCREEN_STATE, SCREEN_MOVE_MENU, SCREEN_SPEED, SCREEN_MPU } ScreenState;
+typedef enum { SCREEN_MAIN_MENU=0, SCREEN_STATE, SCREEN_MOVE_MENU, SCREEN_SPEED, SCREEN_MPU, SCREEN_AUTO_MENU, SCREEN_AUTO_STATE } ScreenState;
 typedef enum { MOVE_AUTO=0, MOVE_LEFT, MOVE_RIGHT, MOVE_STRAIGHT, MOVE_BACK, MOVE_STOP, MOVE_PARKING } MoveMode;
 
 typedef enum {
     PARK_IDLE, PARK_FORWARD_1, PARK_TURN_R, PARK_FORWARD_2, PARK_TURN_L, PARK_DONE
 } ParkingState;
+
+typedef enum { WHEEL_CENTER=0, WHEEL_LEFT, WHEEL_RIGHT } WheelState;
+typedef enum { 
+    DET_NONE=0, DET_ONE_WAY, DET_PARK, DET_TURN_RIGHT, DET_SLOW_DOWN, 
+    DET_GREEN_LIGHT, DET_RED_LIGHT, DET_YELLOW_LIGHT, DET_CROSSWALK, DET_OBSTACLE 
+} DetectState;
+
+typedef enum { AUTO_STATE_DRIVE, AUTO_STATE_TURN_PENDING, AUTO_STATE_XWALK_WAIT, AUTO_STATE_TURNING } AutoDrivingState;
 
 /* --- Peripheral Handles --- */
 TIM_HandleTypeDef htim1, htim2, htim3;
@@ -68,6 +76,19 @@ static float    filteredBatVoltage = 0.0f;
 static uint8_t  displayedBatPercent = 0;
 static uint32_t lastBatUpdateTick = 0;
 
+/* Lane Centering & AI Data */
+static float lateral_error = 0.0f;
+static float heading_error = 0.0f;
+static int   left_pwm = 0, right_pwm = 0;
+
+static uint8_t auto_run_enabled  = 0;
+static uint8_t auto_ai_enabled   = 1;
+static uint8_t auto_lane_enabled = 1;
+static WheelState  wheel_state   = WHEEL_CENTER;
+static DetectState detect_state  = DET_NONE;
+static AutoDrivingState auto_driving_state = AUTO_STATE_DRIVE;
+static uint32_t xwalk_exit_tick = 0; // Timer for crosswalk clearance
+
 typedef struct { uint8_t last, pressed; uint16_t holdCounter; } Button_t;
 static Button_t btnUp, btnDown, btnSelect, btnBack;
 
@@ -88,6 +109,14 @@ static void updateParkingMode(void);
 static void updateJetsonStatus(void);
 static void updateBattery(void);
 static const char* getMoveStateText(MoveMode mode);
+
+/* Lane Centering Functions */
+uint8_t is_auto_mode_enabled(void);
+void compute_motor_pwm(float lat_err, float head_err, int *l_pwm, int *r_pwm);
+void send_motor_command(int l_pwm, int r_pwm);
+void stop_motor(void);
+void process_lane_centering(void);
+void Process_Serial_Data(char *data, uint32_t len);
 
 #define MOVE_MENU_COUNT 7
 static const char *moveNames[] = {"AUTO", "LEFT", "RIGHT", "STRAIGHT", "BACK", "STOP", "PARKING"};
@@ -134,10 +163,25 @@ static const char* getMoveStateText(MoveMode mode) {
     }
 }
 
+static const char* getDetectText(DetectState det) {
+    const char* names[] = {"NONE", "ONEWAY", "PARK", "TURN_R", "SLOW", "GREEN", "RED", "YELLOW", "CROSSWK", "OBSTAC"};
+    if ((int)det >= 0 && (int)det < 10) return names[(int)det];
+    return "???";
+}
+
 static void applyMoveMode(void) {
     if (currentMove == MOVE_PARKING) { parkState = PARK_FORWARD_1; LED_YELLOW(); }
+    else if (currentMove == MOVE_AUTO) {
+        parkState = PARK_IDLE; isTurning = 0;
+        lateral_error = 0.0f; heading_error = 0.0f;
+        LED_GREEN(); // Auto mode indicator
+        currentScreen = SCREEN_AUTO_MENU; // Change to submenu config
+        menuIndex = 0; needRedraw = 1;
+    }
     else {
         parkState = PARK_IDLE; isTurning = 0;
+        LED_OFF();
+        currentScreen = SCREEN_STATE; // Ensure manual modes show state screen
         switch (currentMove) {
             case MOVE_LEFT: Motor_TurnLeft(speedValue); break; case MOVE_RIGHT: Motor_TurnRight(speedValue); break;
             case MOVE_STRAIGHT: Motor_Forward(speedValue); break; case MOVE_BACK: Motor_Backward(speedValue); break;
@@ -188,7 +232,11 @@ static void fmt_float1(char* b, float v) {
 }
 
 static void updateUI(void) {
-  if (!needRedraw && currentScreen != SCREEN_MPU && currentScreen != SCREEN_STATE) return;
+  if (!needRedraw && 
+      currentScreen != SCREEN_MPU && 
+      currentScreen != SCREEN_STATE &&
+      currentScreen != SCREEN_AUTO_MENU &&
+      currentScreen != SCREEN_AUTO_STATE) return;
   needRedraw = 0; SSD1306_Clear(); char buf[32], f[16]; const MPU6050_Data_t *mpu = MPU6050_GetData();
   switch (currentScreen) {
     case SCREEN_MAIN_MENU:
@@ -201,12 +249,18 @@ static void updateUI(void) {
       break;
     case SCREEN_STATE:
       SSD1306_WriteStringInverted(0, 0, "     STATE      ");
-      snprintf(buf, sizeof(buf), "Move : %s", getMoveStateText(currentMove)); SSD1306_WriteString(0, 2, buf);
-      snprintf(buf, sizeof(buf), "Speed: %d", (int)speedValue); SSD1306_WriteString(0, 3, buf);
-      fmt_float1(f, mpu->yaw); snprintf(buf, sizeof(buf), "Angle: %s deg", f); SSD1306_WriteString(0, 4, buf);
-      snprintf(buf, sizeof(buf), "JETSON: %s", jetsonConnected ? "OK" : "ERROR"); SSD1306_WriteString(0, 5, buf);
-      int iv = (int)filteredBatVoltage; int fv = (int)((filteredBatVoltage - iv)*10);
-      snprintf(buf, sizeof(buf), "BAT  : %d.%dV (%d%%)", iv, fv, displayedBatPercent); SSD1306_WriteString(0, 7, buf);
+      snprintf(buf, sizeof(buf), "Move : %-10s", getMoveStateText(currentMove)); SSD1306_WriteString(0, 2, buf);
+      if (currentMove == MOVE_AUTO) {
+          char f2[16];
+          fmt_float1(f, lateral_error); fmt_float1(f2, heading_error);
+          snprintf(buf, sizeof(buf), "L:%s H:%s", f, f2); SSD1306_WriteString(0, 4, buf);
+          snprintf(buf, sizeof(buf), "PWM: L%d R%d", left_pwm, right_pwm); SSD1306_WriteString(0, 5, buf);
+          snprintf(buf, sizeof(buf), "JETSON: %-5s", jetsonConnected ? "OK" : "MISS"); SSD1306_WriteString(0, 7, buf);
+      } else {
+          snprintf(buf, sizeof(buf), "Speed: %d", (int)speedValue); SSD1306_WriteString(0, 3, buf);
+          fmt_float1(f, mpu->yaw); snprintf(buf, sizeof(buf), "Angle: %s deg", f); SSD1306_WriteString(0, 4, buf);
+          snprintf(buf, sizeof(buf), "JETSON: %s", jetsonConnected ? "OK" : "ERROR"); SSD1306_WriteString(0, 6, buf);
+      }
       break;
     case SCREEN_MOVE_MENU:
       SSD1306_WriteStringInverted(0, 0, "      MOVE      ");
@@ -224,7 +278,26 @@ static void updateUI(void) {
       break;
     case SCREEN_SPEED:
       SSD1306_WriteStringInverted(0, 0, "   SPEED MODE   ");
-      snprintf(buf, sizeof(buf), " Speed: %d", (int)speedValue); SSD1306_WriteString(0, 3, buf);
+      snprintf(buf, sizeof(buf), " Base: %d", (int)speedValue); SSD1306_WriteString(0, 3, buf);
+      break;
+    case SCREEN_AUTO_MENU:
+      SSD1306_WriteStringInverted(0, 0, "   AUTO CONFIG  ");
+      snprintf(buf, sizeof(buf), "%s RUN: %s", (menuIndex==0)?">":" ", auto_run_enabled?"ON ":"OFF");
+      SSD1306_WriteString(0, 2, buf);
+      snprintf(buf, sizeof(buf), "%s AI : %s", (menuIndex==1)?">":" ", auto_ai_enabled?"ON ":"OFF");
+      SSD1306_WriteString(0, 3, buf);
+      snprintf(buf, sizeof(buf), "%s LANE: %s", (menuIndex==2)?">":" ", auto_lane_enabled?"ON ":"OFF");
+      SSD1306_WriteString(0, 4, buf);
+      SSD1306_WriteString(0, 6, (menuIndex==3)?"> NEXT SCREEN":"  NEXT SCREEN");
+      break;
+    case SCREEN_AUTO_STATE:
+      SSD1306_WriteStringInverted(0, 0, "   AUTO STATE   ");
+      snprintf(buf, sizeof(buf), "Run:%s AI:%s L:%s", auto_run_enabled?"ON":"OF", auto_ai_enabled?"ON":"OF", auto_lane_enabled?"ON":"OF"); 
+      SSD1306_WriteString(0, 1, buf);
+      const char* w_txt[] = {"CENTERED", "SHFT LEFT", "SHFT RIGHT"};
+      snprintf(buf, sizeof(buf), "WHEEL: %s", w_txt[(int)wheel_state]); SSD1306_WriteString(0, 3, buf);
+      snprintf(buf, sizeof(buf), "DET  : %s", getDetectText(detect_state)); SSD1306_WriteString(0, 5, buf);
+      snprintf(buf, sizeof(buf), "PWM  : L%d R%d", left_pwm, right_pwm); SSD1306_WriteString(0, 7, buf);
       break;
     default: break;
   }
@@ -253,7 +326,17 @@ int main(void) {
         readButtons(); MPU6050_Read_All(); MPU6050_UpdateYaw(dt); updateOdometry(dt); updateJetsonStatus(); updateBattery();
         if (currentScreen == SCREEN_MPU && btnSelect.pressed) MPU6050_ResetYaw();
         
-        /* FIXED Indentation and Logic */
+        // --- Outbound Status Telemetry ---
+        static uint32_t lastLogTick = 0;
+        if (HAL_GetTick() - lastLogTick > 100) {
+            lastLogTick = HAL_GetTick();
+            // Prefix S: [ModeIdx],[Run],[AI],[Lane]
+            printf("S:%d,%d,%d,%d\n", (int)currentMove, (int)auto_run_enabled, (int)auto_ai_enabled, (int)auto_lane_enabled);
+        }
+
+        /* Lane Centering / Auto Mode */
+        process_lane_centering();
+
         if (isTurning) {
             updateTurnController();
         }
@@ -268,13 +351,32 @@ int main(void) {
           case SCREEN_MOVE_MENU:
             if (btnUp.pressed) { menuIndex = (menuIndex <= 0) ? 6 : menuIndex - 1; needRedraw = 1; }
             if (btnDown.pressed) { menuIndex = (menuIndex >= 6) ? 0 : menuIndex + 1; needRedraw = 1; }
-            if (btnSelect.pressed) { currentMove = (MoveMode)menuIndex; applyMoveMode(); currentScreen = SCREEN_STATE; needRedraw = 1; }
+            if (btnSelect.pressed) { 
+                currentMove = (MoveMode)menuIndex; 
+                applyMoveMode(); // This will set currentScreen correctly for AUTO or others
+                needRedraw = 1; 
+            }
             if (btnBack.pressed) { currentScreen = SCREEN_MAIN_MENU; LED_OFF(); needRedraw = 1; }
             break;
           case SCREEN_SPEED:
-            if (btnUp.pressed) { if(speedValue<250) speedValue+=5; needRedraw=1; applyMoveMode(); }
-            if (btnDown.pressed) { if(speedValue>10) speedValue-=5; needRedraw=1; applyMoveMode(); }
+            if (btnUp.pressed) { if(speedValue<250) speedValue+=5; needRedraw=1; }
+            if (btnDown.pressed) { if(speedValue>10) speedValue-=5; needRedraw=1; }
             if (btnBack.pressed) { currentScreen = SCREEN_MAIN_MENU; needRedraw = 1; }
+            break;
+          case SCREEN_AUTO_MENU:
+            if (btnUp.pressed) { menuIndex = (menuIndex <= 0) ? 3 : menuIndex - 1; needRedraw = 1; }
+            if (btnDown.pressed) { menuIndex = (menuIndex >= 3) ? 0 : menuIndex + 1; needRedraw = 1; }
+            if (btnSelect.pressed) {
+                if (menuIndex == 0) auto_run_enabled = !auto_run_enabled;
+                else if (menuIndex == 1) auto_ai_enabled = !auto_ai_enabled;
+                else if (menuIndex == 2) auto_lane_enabled = !auto_lane_enabled;
+                else if (menuIndex == 3) { currentScreen = SCREEN_AUTO_STATE; menuIndex = 0; }
+                needRedraw = 1;
+            }
+            if (btnBack.pressed) { currentScreen = SCREEN_MOVE_MENU; needRedraw = 1; }
+            break;
+          case SCREEN_AUTO_STATE:
+            if (btnBack.pressed) { currentScreen = SCREEN_AUTO_MENU; needRedraw = 1; }
             break;
           default: if (btnBack.pressed) { currentScreen = SCREEN_MAIN_MENU; needRedraw = 1; } break;
         }
@@ -317,6 +419,159 @@ static void MX_I2C1_Init(void) {
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2; hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT; HAL_I2C_Init(&hi2c1);
   GPIO_InitTypeDef G = {0}; G.Pin = GPIO_PIN_6|GPIO_PIN_7; G.Mode = GPIO_MODE_AF_OD; G.Pull = GPIO_PULLUP; G.Speed = GPIO_SPEED_FREQ_VERY_HIGH; G.Alternate = GPIO_AF4_I2C1; HAL_GPIO_Init(GPIOB, &G);
 }
+
+/* -----------------------------------------------------------------------
+ * LANE CENTERING & AUTO MODE LOGIC
+ * ----------------------------------------------------------------------- */
+
+uint8_t is_auto_mode_enabled(void) {
+    return (currentMove == MOVE_AUTO);
+}
+
+void stop_motor(void) {
+    Motor_Stop();
+    left_pwm = 0; right_pwm = 0;
+}
+
+void send_motor_command(int l_pwm, int r_pwm) {
+    // Clamp PWM values to 0-255
+    if (l_pwm > 255) l_pwm = 255;
+    if (l_pwm < 0)   l_pwm = 0;
+    if (r_pwm > 255) r_pwm = 255;
+    if (r_pwm < 0)   r_pwm = 0;
+    
+    Motor_Set_Speed((int16_t)l_pwm, (int16_t)r_pwm);
+}
+
+void compute_motor_pwm(float lat_err, float head_err, int *l_pwm, int *r_pwm) {
+    float base_pwm = (float)speedValue;
+    if (detect_state == DET_SLOW_DOWN) base_pwm *= 0.5f; // Reduce to 50%
+    
+    // Safety check: if lane centering is disabled, just drive straight
+    if (!auto_lane_enabled) {
+        *l_pwm = (int)base_pwm;
+        *r_pwm = (int)base_pwm;
+        wheel_state = WHEEL_CENTER;
+        return;
+    }
+
+    // P-control for lane centering
+    float kp_lat = 0.8f;
+    float kp_head = 30.0f; 
+    
+    float steering = (lat_err * kp_lat) + (head_err * kp_head);
+    
+    *l_pwm = (int)(base_pwm + steering);
+    *r_pwm = (int)(base_pwm - steering);
+
+    // Update wheel status display based on error
+    if (lat_err > 20) wheel_state = WHEEL_RIGHT;
+    else if (lat_err < -20) wheel_state = WHEEL_LEFT;
+    else wheel_state = WHEEL_CENTER;
+}
+
+void process_lane_centering(void) {
+    if (!is_auto_mode_enabled()) return;
+    
+    // 1. If Run is OFF, stop everything
+    if (!auto_run_enabled) {
+        stop_motor();
+        auto_driving_state = AUTO_STATE_DRIVE; // Reset state
+        return;
+    }
+
+    // 2. Safety: If Jetson is not connected, stop
+    if (!jetsonConnected) {
+        stop_motor();
+        return;
+    }
+
+    // 3. Auto Mode State Machine for Mission (Turning Logic)
+    if (auto_ai_enabled) {
+        // Global detection overrides
+        if (detect_state == DET_RED_LIGHT || detect_state == DET_OBSTACLE) {
+            stop_motor();
+            return;
+        }
+
+        switch (auto_driving_state) {
+            case AUTO_STATE_DRIVE:
+                if (detect_state == DET_TURN_RIGHT) {
+                    auto_driving_state = AUTO_STATE_TURN_PENDING;
+                    xwalk_exit_tick = HAL_GetTick(); // Start 2s countdown
+                }
+                break;
+
+            case AUTO_STATE_TURN_PENDING:
+                // Start of timer logic: we need 2s of NO crosswalk to turn
+                if (detect_state == DET_CROSSWALK) {
+                    auto_driving_state = AUTO_STATE_XWALK_WAIT;
+                    xwalk_exit_tick = HAL_GetTick(); // Initial tick
+                } 
+                else if (HAL_GetTick() - xwalk_exit_tick > 2000) {
+                    // It's been 2s and we never saw a crosswalk or it cleared
+                    startTurnRelative(90.0f);
+                    auto_driving_state = AUTO_STATE_TURNING;
+                    return;
+                }
+                break;
+
+            case AUTO_STATE_XWALK_WAIT:
+                if (detect_state == DET_CROSSWALK) {
+                    xwalk_exit_tick = HAL_GetTick(); // Keep resetting if still seen
+                } 
+                else if (HAL_GetTick() - xwalk_exit_tick > 2000) {
+                    // Gone for 2 seconds
+                    startTurnRelative(90.0f);
+                    auto_driving_state = AUTO_STATE_TURNING;
+                    return;
+                }
+                break;
+
+            case AUTO_STATE_TURNING:
+                if (updateTurnController()) {
+                    auto_driving_state = AUTO_STATE_DRIVE; // Turn finished
+                }
+                return; // Prevent lane centering from fighting the turn
+
+            default: break;
+        }
+    } else {
+        auto_driving_state = AUTO_STATE_DRIVE;
+    }
+
+    // 4. Normal Lane Centering (if not turning)
+    compute_motor_pwm(lateral_error, heading_error, &left_pwm, &right_pwm);
+    send_motor_command(left_pwm, right_pwm);
+}
+
+/**
+ * Expected format: "L:1.23,H:4.56" or similar.
+ * Let's assume CSV: "LAT,HEAD"
+ */
+void Process_Serial_Data(char *data, uint32_t len) {
+    // Expected formats: 
+    // "L:val,H:val" -> Lane errors
+    // "D:idx" -> Detection index
+    
+    char *l_ptr = strstr(data, "L:");
+    char *h_ptr = strstr(data, "H:");
+    char *d_ptr = strstr(data, "D:");
+    
+    if (l_ptr && h_ptr) {
+        lateral_error = atof(l_ptr + 2);
+        heading_error = atof(h_ptr + 2);
+        lastJetsonRxTick = HAL_GetTick(); 
+    }
+    
+    if (d_ptr) {
+        detect_state = (DetectState)atoi(d_ptr + 2);
+        lastJetsonRxTick = HAL_GetTick();
+    }
+}
+
+/* ----------------------------------------------------------------------- */
+
 static void updateBtn(GPIO_TypeDef* port, uint16_t pin, Button_t* b) {
   uint8_t raw = (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET);
   if (raw) { b->holdCounter++; if(b->holdCounter==1 || (b->holdCounter>=10 && b->holdCounter%2==0)) b->pressed=1; else b->pressed=0; }

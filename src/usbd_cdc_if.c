@@ -101,13 +101,18 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t *pbuf, uint16_t length)
 
 extern void Jetson_Heartbeat_Callback(void);
 
+extern void Process_Serial_Data(char *data, uint32_t len);
+
 /* Called by middleware when host sends data to device */
 static int8_t CDC_Receive_FS(uint8_t *pbuf, uint32_t *Len)
 {
-  (void)pbuf; (void)Len;
+  static char rx_str[64];
+  uint32_t length = (*Len < 63) ? *Len : 63;
   
-  /* Signal that we received data (heartbeat) */
-  Jetson_Heartbeat_Callback();
+  memcpy(rx_str, pbuf, length);
+  rx_str[length] = '\0';
+  
+  Process_Serial_Data(rx_str, length);
   
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);

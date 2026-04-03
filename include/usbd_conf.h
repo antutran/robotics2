@@ -24,6 +24,7 @@ extern "C" {
 #define USBD_free           free
 #define USBD_memset         memset
 #define USBD_memcpy         memcpy
+#define USBD_Delay          HAL_Delay
 
 /* Debug macros (disabled) */
 #if (USBD_DEBUG_LEVEL > 0U)

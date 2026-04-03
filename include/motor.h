@@ -29,6 +29,7 @@ void Motor_Backward(uint8_t pwm);
 void Motor_TurnLeft(uint8_t pwm);
 void Motor_TurnRight(uint8_t pwm);
 void Motor_Stop(void);
+void Motor_Set_Speed(int16_t left_pwm, int16_t right_pwm);
 
 /* LED helpers (PB3, PB4, PB5) */
 void LED_Run(void);    /* Green */

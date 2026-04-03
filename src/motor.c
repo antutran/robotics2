@@ -78,6 +78,38 @@ void Motor_Stop(void) {
     __HAL_TIM_SET_COMPARE(motor_tim, TIM_CHANNEL_2, 0);
 }
 
+void Motor_Set_Speed(int16_t left, int16_t right) {
+    if (motor_tim == NULL) return;
+
+    // LEFT MOTOR
+    if (left == 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10 | GPIO_PIN_2, GPIO_PIN_RESET);
+        __HAL_TIM_SET_COMPARE(motor_tim, TIM_CHANNEL_1, 0);
+    } else if (left > 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_RESET);
+        __HAL_TIM_SET_COMPARE(motor_tim, TIM_CHANNEL_1, scalePWM((uint8_t)left));
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_2, GPIO_PIN_SET);
+        __HAL_TIM_SET_COMPARE(motor_tim, TIM_CHANNEL_1, scalePWM((uint8_t)(-left)));
+    }
+
+    // RIGHT MOTOR
+    if (right == 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_13, GPIO_PIN_RESET);
+        __HAL_TIM_SET_COMPARE(motor_tim, TIM_CHANNEL_2, 0);
+    } else if (right > 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+        __HAL_TIM_SET_COMPARE(motor_tim, TIM_CHANNEL_2, scalePWM((uint8_t)right));
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+        __HAL_TIM_SET_COMPARE(motor_tim, TIM_CHANNEL_2, scalePWM((uint8_t)(-right)));
+    }
+}
+
 /* LED logic */
 void LED_Run(void) {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3 | GPIO_PIN_4, GPIO_PIN_RESET);
