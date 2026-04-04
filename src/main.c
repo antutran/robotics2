@@ -45,7 +45,11 @@ typedef enum {
     DET_GREEN_LIGHT, DET_RED_LIGHT, DET_YELLOW_LIGHT, DET_CROSSWALK, DET_OBSTACLE 
 } DetectState;
 
-typedef enum { AUTO_STATE_DRIVE, AUTO_STATE_TURN_PENDING, AUTO_STATE_XWALK_WAIT, AUTO_STATE_TURNING } AutoDrivingState;
+typedef enum { 
+    AUTO_STATE_DRIVE, 
+    AUTO_STATE_TURN_PENDING, AUTO_STATE_XWALK_WAIT, AUTO_STATE_TURNING,
+    AUTO_STATE_PARK_PENDING, AUTO_STATE_PARK_TURN_R, AUTO_STATE_PARK_FORWARD, AUTO_STATE_PARK_TURN_L 
+} AutoDrivingState;
 
 /* --- Peripheral Handles --- */
 TIM_HandleTypeDef htim1, htim2, htim3;
@@ -58,7 +62,7 @@ static ScreenState  currentScreen = SCREEN_MAIN_MENU;
 static MoveMode     currentMove   = MOVE_STOP;
 static ParkingState parkState     = PARK_IDLE;
 static int8_t       menuIndex     = 0;
-static uint8_t      speedValue    = 55;
+static uint8_t      speedValue    = 100;
 static uint8_t      needRedraw    = 1;
 
 /* Encoder & Speed Data */
@@ -500,6 +504,9 @@ void process_lane_centering(void) {
                     auto_driving_state = AUTO_STATE_TURN_PENDING;
                     xwalk_exit_tick = HAL_GetTick(); // Start 2s countdown
                 }
+                else if (detect_state == DET_PARK) {
+                    auto_driving_state = AUTO_STATE_PARK_PENDING;
+                }
                 break;
 
             case AUTO_STATE_TURN_PENDING:
@@ -534,6 +541,40 @@ void process_lane_centering(void) {
                     auto_driving_state = AUTO_STATE_DRIVE; // Turn finished
                 }
                 return; // Prevent lane centering from fighting the turn
+
+            case AUTO_STATE_PARK_PENDING:
+                // We saw the sign. Stay in this state while still seeing it.
+                if (detect_state != DET_PARK) {
+                    // Sign disappeared! Start parking sequence.
+                    startTurnRelative(90.0f);
+                    auto_driving_state = AUTO_STATE_PARK_TURN_R;
+                    return;
+                }
+                break;
+
+            case AUTO_STATE_PARK_TURN_R:
+                if (updateTurnController()) {
+                    parkStartTime = HAL_GetTick();
+                    auto_driving_state = AUTO_STATE_PARK_FORWARD;
+                }
+                return;
+
+            case AUTO_STATE_PARK_FORWARD:
+                Motor_Forward(speedValue);
+                if (HAL_GetTick() - parkStartTime > 1000) {
+                    startTurnRelative(-90.0f);
+                    auto_driving_state = AUTO_STATE_PARK_TURN_L;
+                }
+                return;
+
+            case AUTO_STATE_PARK_TURN_L:
+                if (updateTurnController()) {
+                    auto_run_enabled = 0; // Mission complete
+                    stop_motor();
+                    auto_driving_state = AUTO_STATE_DRIVE;
+                    needRedraw = 1;
+                }
+                return;
 
             default: break;
         }
