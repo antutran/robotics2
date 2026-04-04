@@ -99,6 +99,7 @@ def main():
                 current_top_priority = -1
                 
                 results = model.predict(frame, stream=True, conf=0.5, verbose=False)
+                crosswalk_count = 0
                 for r in results:
                     for box in r.boxes:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -106,7 +107,11 @@ def main():
                         conf = float(box.conf[0])
                         label = r.names[cls_idx]
                         
-                        # Get priority of this detection (default to 0 if not special)
+                        # Count crosswalks for intersection detection
+                        if cls_idx == 7:
+                            crosswalk_count += 1
+
+                        # Get priority of this detection (default to 10 if not special)
                         prio = priority_map.get(cls_idx, 10)
                         
                         if prio > current_top_priority:
@@ -117,6 +122,14 @@ def main():
                         cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                         cv2.putText(display_frame, f"{label} {conf:.2f}", (x1, y1-10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Intersection Detection: 3 or 4 crosswalks
+                if crosswalk_count >= 3:
+                    # Priority of Intersection (reusing TURN_RIGHT index 2) is 60
+                    if current_top_priority < 60:
+                        current_top_priority = 60
+                        best_det = 2
+                        print(f"🚦 Intersection Detected! ({crosswalk_count} crosswalks)")
             
             # 3. Communications (Safe Write)
             safe_send(f"D:{best_det + 1}\n") # If no det, sends D:0

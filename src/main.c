@@ -503,13 +503,14 @@ void process_lane_centering(void) {
                 break;
 
             case AUTO_STATE_TURN_PENDING:
-                // Start of timer logic: we need 2s of NO crosswalk to turn
-                if (detect_state == DET_CROSSWALK) {
+                // Intersection triggered. Wait until no more intersection/crosswalk seen.
+                if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
                     auto_driving_state = AUTO_STATE_XWALK_WAIT;
-                    xwalk_exit_tick = HAL_GetTick(); // Initial tick
+                    xwalk_exit_tick = HAL_GetTick(); // Keep resetting
                 } 
                 else if (HAL_GetTick() - xwalk_exit_tick > 2000) {
-                    // It's been 2s and we never saw a crosswalk or it cleared
+                    // This case is if we triggered TURN_RIGHT but never saw CROSSWALK 
+                    // and then nothing happens for 2s. 
                     startTurnRelative(90.0f);
                     auto_driving_state = AUTO_STATE_TURNING;
                     return;
@@ -517,11 +518,11 @@ void process_lane_centering(void) {
                 break;
 
             case AUTO_STATE_XWALK_WAIT:
-                if (detect_state == DET_CROSSWALK) {
-                    xwalk_exit_tick = HAL_GetTick(); // Keep resetting if still seen
+                if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
+                    xwalk_exit_tick = HAL_GetTick(); // Still in crossing/intersection zone
                 } 
                 else if (HAL_GetTick() - xwalk_exit_tick > 2000) {
-                    // Gone for 2 seconds
+                    // All clear for 2 seconds
                     startTurnRelative(90.0f);
                     auto_driving_state = AUTO_STATE_TURNING;
                     return;
