@@ -32,7 +32,7 @@
 #define JETSON_TIMEOUT_MS   2000
 
 /* --- State Machine Enums --- */
-typedef enum { SCREEN_MAIN_MENU=0, SCREEN_STATE, SCREEN_MOVE_MENU, SCREEN_SPEED, SCREEN_MPU, SCREEN_AUTO_MENU, SCREEN_AUTO_STATE } ScreenState;
+typedef enum { SCREEN_MAIN_MENU=0, SCREEN_STATE, SCREEN_MOVE_MENU, SCREEN_SPEED, SCREEN_MPU, SCREEN_MPU_DATA, SCREEN_AUTO_MENU, SCREEN_AUTO_STATE } ScreenState;
 typedef enum { MOVE_AUTO=0, MOVE_LEFT, MOVE_RIGHT, MOVE_STRAIGHT, MOVE_BACK, MOVE_STOP, MOVE_PARKING } MoveMode;
 
 typedef enum {
@@ -62,7 +62,7 @@ static ScreenState  currentScreen = SCREEN_MAIN_MENU;
 static MoveMode     currentMove   = MOVE_STOP;
 static ParkingState parkState     = PARK_IDLE;
 static int8_t       menuIndex     = 0;
-static uint8_t      speedValue    = 100;
+static uint8_t      speedValue    = 80;
 static uint8_t      needRedraw    = 1;
 
 /* Encoder & Speed Data */
@@ -92,6 +92,7 @@ static WheelState  wheel_state   = WHEEL_CENTER;
 static DetectState detect_state  = DET_NONE;
 static AutoDrivingState auto_driving_state = AUTO_STATE_DRIVE;
 static uint32_t xwalk_exit_tick = 0; // Timer for crosswalk clearance
+static uint32_t oneway_lock_tick = 0; // Timer for one-way sign lockout (5s)
 
 typedef struct { uint8_t last, pressed; uint16_t holdCounter; } Button_t;
 static Button_t btnUp, btnDown, btnSelect, btnBack;
@@ -238,6 +239,7 @@ static void fmt_float1(char* b, float v) {
 static void updateUI(void) {
   if (!needRedraw && 
       currentScreen != SCREEN_MPU && 
+      currentScreen != SCREEN_MPU_DATA && 
       currentScreen != SCREEN_STATE &&
       currentScreen != SCREEN_AUTO_MENU &&
       currentScreen != SCREEN_AUTO_STATE) return;
@@ -274,7 +276,16 @@ static void updateUI(void) {
       }
       break;
     case SCREEN_MPU:
-      SSD1306_WriteStringInverted(0, 0, "    MPU MODE    ");
+      SSD1306_WriteStringInverted(0, 0, "    MPU MENU    ");
+      snprintf(buf, sizeof(buf), "%s DISPLAY DATA", (menuIndex==0)?">":" ");
+      if(menuIndex==0) SSD1306_WriteStringInverted(0, 2, buf); else SSD1306_WriteString(0, 2, buf);
+      snprintf(buf, sizeof(buf), "%s RESET YAW", (menuIndex==1)?">":" ");
+      if(menuIndex==1) SSD1306_WriteStringInverted(0, 4, buf); else SSD1306_WriteString(0, 4, buf);
+      snprintf(buf, sizeof(buf), "%s CALIBRATE", (menuIndex==2)?">":" ");
+      if(menuIndex==2) SSD1306_WriteStringInverted(0, 6, buf); else SSD1306_WriteString(0, 6, buf);
+      break;
+    case SCREEN_MPU_DATA:
+      SSD1306_WriteStringInverted(0, 0, "    MPU DATA    ");
       fmt_float1(f, mpu->yaw); snprintf(buf, sizeof(buf), "Yaw  : %s deg", f); SSD1306_WriteString(0, 2, buf);
       snprintf(buf, sizeof(buf), "Rate : %d dps", (int)mpu->gz); SSD1306_WriteString(0, 4, buf);
       snprintf(buf, sizeof(buf), "Speed: %d mm/s", (int)(speedAvg * 1000)); SSD1306_WriteString(0, 5, buf);
@@ -328,7 +339,7 @@ int main(void) {
     if (HAL_GetTick() - lastTick >= 50) {
         float dt = (HAL_GetTick() - lastTick) / 1000.0f; lastTick = HAL_GetTick();
         readButtons(); MPU6050_Read_All(); MPU6050_UpdateYaw(dt); updateOdometry(dt); updateJetsonStatus(); updateBattery();
-        if (currentScreen == SCREEN_MPU && btnSelect.pressed) MPU6050_ResetYaw();
+        // --- Handled in switch below ---
         
         // --- Outbound Status Telemetry ---
         static uint32_t lastLogTick = 0;
@@ -381,6 +392,25 @@ int main(void) {
             break;
           case SCREEN_AUTO_STATE:
             if (btnBack.pressed) { currentScreen = SCREEN_AUTO_MENU; needRedraw = 1; }
+            break;
+          case SCREEN_MPU:
+            if (btnUp.pressed) { menuIndex = (menuIndex <= 0) ? 2 : menuIndex - 1; needRedraw = 1; }
+            if (btnDown.pressed) { menuIndex = (menuIndex >= 2) ? 0 : menuIndex + 1; needRedraw = 1; }
+            if (btnSelect.pressed) {
+                if (menuIndex == 0) { currentScreen = SCREEN_MPU_DATA; }
+                else if (menuIndex == 1) { MPU6050_ResetYaw(); }
+                else if (menuIndex == 2) { 
+                    SSD1306_Clear();
+                    SSD1306_WriteString(0, 3, " CALIBRATING...");
+                    SSD1306_UpdateScreen();
+                    MPU6050_Calibrate(500); 
+                }
+                needRedraw = 1;
+            }
+            if (btnBack.pressed) { currentScreen = SCREEN_MAIN_MENU; menuIndex = 0; needRedraw = 1; }
+            break;
+          case SCREEN_MPU_DATA:
+            if (btnBack.pressed) { currentScreen = SCREEN_MPU; needRedraw = 1; }
             break;
           default: if (btnBack.pressed) { currentScreen = SCREEN_MAIN_MENU; needRedraw = 1; } break;
         }
@@ -492,15 +522,36 @@ void process_lane_centering(void) {
 
     // 3. Auto Mode State Machine for Mission (Turning Logic)
     if (auto_ai_enabled) {
-        // Global detection overrides
-        if (detect_state == DET_RED_LIGHT || detect_state == DET_OBSTACLE) {
-            stop_motor();
-            return;
+        // 1. One-Way Lockout check (5 seconds)
+        if (detect_state == DET_ONE_WAY) {
+            oneway_lock_tick = HAL_GetTick(); // Start/Reset 5s timer
+        }
+
+        uint8_t in_oneway_lock = (oneway_lock_tick != 0 && (HAL_GetTick() - oneway_lock_tick < 5000));
+        
+        if (in_oneway_lock) {
+            // During 5s lock, stay in DRIVE mode even if other signs are seen
+            // But still respect critical safety (Obstable/Red Light)
+            if (detect_state == DET_RED_LIGHT || detect_state == DET_OBSTACLE) {
+                stop_motor();
+                return;
+            }
+            auto_driving_state = AUTO_STATE_DRIVE;
+            // Proceed to motor computation (lane centering still active)
+        } else {
+            // Global detection overrides (only if not in oneway lock)
+            if (detect_state == DET_RED_LIGHT || detect_state == DET_OBSTACLE) {
+                stop_motor();
+                return;
+            }
         }
 
         switch (auto_driving_state) {
             case AUTO_STATE_DRIVE:
-                if (detect_state == DET_TURN_RIGHT) {
+                if (in_oneway_lock) {
+                     // Stay here
+                }
+                else if (detect_state == DET_TURN_RIGHT) {
                     auto_driving_state = AUTO_STATE_TURN_PENDING;
                     xwalk_exit_tick = HAL_GetTick(); // Start 2s countdown
                 }
@@ -510,8 +561,11 @@ void process_lane_centering(void) {
                 break;
 
             case AUTO_STATE_TURN_PENDING:
+                if (in_oneway_lock) {
+                    auto_driving_state = AUTO_STATE_DRIVE; // Abort turn if one-way sign appears
+                }
                 // Intersection triggered. Wait until no more intersection/crosswalk seen.
-                if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
+                else if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
                     auto_driving_state = AUTO_STATE_XWALK_WAIT;
                     xwalk_exit_tick = HAL_GetTick(); // Keep resetting
                 } 
@@ -525,7 +579,10 @@ void process_lane_centering(void) {
                 break;
 
             case AUTO_STATE_XWALK_WAIT:
-                if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
+                if (in_oneway_lock) {
+                    auto_driving_state = AUTO_STATE_DRIVE; // Abort turn if one-way sign appears
+                }
+                else if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
                     xwalk_exit_tick = HAL_GetTick(); // Still in crossing/intersection zone
                 } 
                 else if (HAL_GetTick() - xwalk_exit_tick > 2000) {
@@ -561,7 +618,7 @@ void process_lane_centering(void) {
 
             case AUTO_STATE_PARK_FORWARD:
                 Motor_Forward(speedValue);
-                if (HAL_GetTick() - parkStartTime > 1000) {
+                if (HAL_GetTick() - parkStartTime > 3000) {
                     startTurnRelative(-90.0f);
                     auto_driving_state = AUTO_STATE_PARK_TURN_L;
                 }

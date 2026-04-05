@@ -95,7 +95,7 @@ def main():
             if ai_enabled:
                 # Define priority: Obstacle (8) > Red (5) > Slow (3) > Yellow (6) > others
                 # Indices based on previous mapping: {0:oneway, 1:park, 2:turn_right, 3:slow, 4:green, 5:red, 6:yellow, 7:crosswalk, 8:obstacle}
-                priority_map = {8: 100, 5: 90, 3: 80, 6: 70, 2: 60, 7: 50} 
+                priority_map = {8: 100, 5: 90, 1: 85, 3: 80, 0: 75, 6: 70, 2: 60, 7: 50} 
                 current_top_priority = -1
                 
                 results = model.predict(frame, stream=True, conf=0.5, verbose=False)
