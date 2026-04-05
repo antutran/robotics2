@@ -63,10 +63,9 @@ while True:
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, LOWER_YELLOW, UPPER_YELLOW)
 
-    # Noise removal
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    # [IMPROVED] Use LaneProcessor's morphology instead of manual kernels
+    # This includes vertical-emphasis filtering to suppress crosswalk bars
+    mask = lane_proc.apply_morphology(mask)
 
     # 3. Process Lane Geometry
     try:

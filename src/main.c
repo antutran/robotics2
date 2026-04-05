@@ -85,7 +85,9 @@ static uint32_t lastBatUpdateTick = 0;
 /* Lane Centering & AI Data */
 static float lateral_error = 0.0f;
 static float heading_error = 0.0f;
+static float speed_factor = 1.0f;   /* [NEW] Curve speed reduction from Jetson (0.0-1.0) */
 static int   left_pwm = 0, right_pwm = 0;
+static float prev_steering = 0.0f;  /* [NEW] Previous steering for rate limiting */
 
 static uint8_t auto_run_enabled  = 0;
 static uint8_t auto_ai_enabled   = 1;
@@ -484,6 +486,9 @@ void compute_motor_pwm(float lat_err, float head_err, int *l_pwm, int *r_pwm) {
     float base_pwm = (float)speedValue;
     if (detect_state == DET_SLOW_DOWN) base_pwm *= 0.5f; // Reduce to 50%
     
+    /* [NEW] Apply curve speed reduction from Jetson */
+    base_pwm *= speed_factor;
+    
     // Safety check: if lane centering is disabled, just drive straight
     if (!auto_lane_enabled) {
         *l_pwm = (int)base_pwm;
@@ -492,11 +497,24 @@ void compute_motor_pwm(float lat_err, float head_err, int *l_pwm, int *r_pwm) {
         return;
     }
 
-    // P-control for lane centering
-    float kp_lat = 0.8f;
-    float kp_head = 30.0f; 
+    /* [IMPROVED] PD-control for lane centering with rate limiting
+     * TODO: Tune kp_lat, kp_head, kd_steer, max_steer_delta */
+    float kp_lat  = 0.6f;     /* TODO: Tune - lateral P gain (was 0.8) */
+    float kp_head = 2.0f;     /* TODO: Tune - heading P gain (was 30.0, now normalized) */
+    float kd_steer = 0.15f;   /* TODO: Tune - derivative damping on steering output */
+    float max_steer_delta = 8.0f; /* TODO: Tune - max steering change per cycle */
     
-    float steering = (lat_err * kp_lat) + (head_err * kp_head);
+    float raw_steering = (lat_err * kp_lat) + (head_err * kp_head);
+    
+    /* [NEW] Rate limiting: prevent sudden steering jumps */
+    float steer_delta = raw_steering - prev_steering;
+    if (steer_delta >  max_steer_delta) steer_delta =  max_steer_delta;
+    if (steer_delta < -max_steer_delta) steer_delta = -max_steer_delta;
+    float steering = prev_steering + steer_delta;
+    
+    /* [NEW] Derivative damping: oppose rapid changes */
+    steering -= kd_steer * steer_delta;
+    prev_steering = steering;
     
     *l_pwm = (int)(base_pwm + steering);
     *r_pwm = (int)(base_pwm - steering);
@@ -680,17 +698,24 @@ void process_lane_centering(void) {
  */
 void Process_Serial_Data(char *data, uint32_t len) {
     // Expected formats: 
-    // "L:val,H:val" -> Lane errors
+    // "L:val,H:val,F:val" -> Lane errors + speed factor
     // "D:idx" -> Detection index
     
     char *l_ptr = strstr(data, "L:");
     char *h_ptr = strstr(data, "H:");
     char *d_ptr = strstr(data, "D:");
+    char *f_ptr = strstr(data, "F:"); /* [NEW] Speed factor */
     
     if (l_ptr && h_ptr) {
         lateral_error = atof(l_ptr + 2);
         heading_error = atof(h_ptr + 2);
         lastJetsonRxTick = HAL_GetTick(); 
+    }
+    
+    /* [NEW] Parse speed factor from Jetson */
+    if (f_ptr) {
+        float f_val = atof(f_ptr + 2);
+        if (f_val >= 0.0f && f_val <= 1.0f) speed_factor = f_val;
     }
     
     if (d_ptr) {

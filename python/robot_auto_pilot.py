@@ -82,13 +82,17 @@ def main():
         display_frame = frame.copy()
         
         if auto_mode:
-            # --- 1. Lane Processing ---
+            # --- 1. Lane Processing (IMPROVED) ---
             roi = lane_proc.get_roi(frame)
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, LOWER_YELLOW, UPPER_YELLOW)
+            # [NEW] Apply morphology to suppress crosswalk bars and noise
+            mask = lane_proc.apply_morphology(mask)
             
             left, right, center = lane_proc.process_mask(mask)
             heading, lateral = lane_proc.calculate_errors(center)
+            # [NEW] Get speed reduction factor for curves
+            speed_factor = lane_proc.get_speed_factor()
             
             # --- 2. AI Processing ---
             best_det = -1 # None
@@ -134,7 +138,8 @@ def main():
             # 3. Communications (Safe Write)
             safe_send(f"D:{best_det + 1}\n") # If no det, sends D:0
             if run_enabled:
-                safe_send(f"L:{lateral:.2f},H:{heading:.2f}\n")
+                # [IMPROVED] Send speed factor alongside lane errors
+                safe_send(f"L:{lateral:.2f},H:{heading:.2f},F:{speed_factor:.2f}\n")
 
             # Draw Lane Overlay
             display_frame = lane_proc.draw_overlay(display_frame, left, right, center, heading, lateral)
