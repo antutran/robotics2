@@ -42,13 +42,15 @@ typedef enum {
 typedef enum { WHEEL_CENTER=0, WHEEL_LEFT, WHEEL_RIGHT } WheelState;
 typedef enum { 
     DET_NONE=0, DET_ONE_WAY, DET_PARK, DET_TURN_RIGHT, DET_SLOW_DOWN, 
-    DET_GREEN_LIGHT, DET_RED_LIGHT, DET_YELLOW_LIGHT, DET_CROSSWALK, DET_OBSTACLE 
+    DET_GREEN_LIGHT, DET_RED_LIGHT, DET_YELLOW_LIGHT, DET_CROSSWALK, DET_OBSTACLE,
+    DET_TURN_RIGHT_MARKING 
 } DetectState;
 
 typedef enum { 
     AUTO_STATE_DRIVE, 
     AUTO_STATE_TURN_PENDING, AUTO_STATE_XWALK_WAIT, AUTO_STATE_TURNING,
-    AUTO_STATE_PARK_PENDING, AUTO_STATE_PARK_TURN_R, AUTO_STATE_PARK_FORWARD, AUTO_STATE_PARK_TURN_L 
+    AUTO_STATE_PARK_PENDING, AUTO_STATE_PARK_TURN_R, AUTO_STATE_PARK_FORWARD, AUTO_STATE_PARK_TURN_L,
+    AUTO_STATE_TURN_MARK_WAIT, AUTO_STATE_TURN_MARKING
 } AutoDrivingState;
 
 /* --- Peripheral Handles --- */
@@ -93,6 +95,7 @@ static DetectState detect_state  = DET_NONE;
 static AutoDrivingState auto_driving_state = AUTO_STATE_DRIVE;
 static uint32_t xwalk_exit_tick = 0; // Timer for crosswalk clearance
 static uint32_t oneway_lock_tick = 0; // Timer for one-way sign lockout (5s)
+static uint32_t turn_mark_exit_tick = 0; // Timer for turn marking disappearance (3s)
 
 typedef struct { uint8_t last, pressed; uint16_t holdCounter; } Button_t;
 static Button_t btnUp, btnDown, btnSelect, btnBack;
@@ -169,8 +172,8 @@ static const char* getMoveStateText(MoveMode mode) {
 }
 
 static const char* getDetectText(DetectState det) {
-    const char* names[] = {"NONE", "ONEWAY", "PARK", "TURN_R", "SLOW", "GREEN", "RED", "YELLOW", "CROSSWK", "OBSTAC"};
-    if ((int)det >= 0 && (int)det < 10) return names[(int)det];
+    const char* names[] = {"NONE", "ONEWAY", "PARK", "TURN_R", "SLOW", "GREEN", "RED", "YELLOW", "CROSSWK", "OBSTAC", "T_MARK"};
+    if ((int)det >= 0 && (int)det < 11) return names[(int)det];
     return "???";
 }
 
@@ -555,6 +558,9 @@ void process_lane_centering(void) {
                     auto_driving_state = AUTO_STATE_TURN_PENDING;
                     xwalk_exit_tick = HAL_GetTick(); // Start 2s countdown
                 }
+                else if (detect_state == DET_TURN_RIGHT_MARKING) {
+                    auto_driving_state = AUTO_STATE_TURN_MARK_WAIT;
+                }
                 else if (detect_state == DET_PARK) {
                     auto_driving_state = AUTO_STATE_PARK_PENDING;
                 }
@@ -630,6 +636,30 @@ void process_lane_centering(void) {
                     stop_motor();
                     auto_driving_state = AUTO_STATE_DRIVE;
                     needRedraw = 1;
+                }
+                return;
+
+            case AUTO_STATE_TURN_MARK_WAIT:
+                if (in_oneway_lock) {
+                    auto_driving_state = AUTO_STATE_DRIVE;
+                }
+                else if (detect_state == DET_TURN_RIGHT_MARKING) {
+                    // Still seeing it, keep moving/reset exit timer
+                    turn_mark_exit_tick = 0; 
+                } else {
+                    // Sign disappeared! Start 3s countdown
+                    if (turn_mark_exit_tick == 0) turn_mark_exit_tick = HAL_GetTick();
+                    if (HAL_GetTick() - turn_mark_exit_tick > 3000) {
+                        startTurnRelative(90.0f);
+                        auto_driving_state = AUTO_STATE_TURN_MARKING;
+                        return;
+                    }
+                }
+                break;
+
+            case AUTO_STATE_TURN_MARKING:
+                if (updateTurnController()) {
+                    auto_driving_state = AUTO_STATE_DRIVE;
                 }
                 return;
 
