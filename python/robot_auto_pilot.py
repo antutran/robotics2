@@ -2,14 +2,19 @@ import cv2
 import numpy as np
 import serial
 import time
+import pygame  # Added for better keyboard control
 from ultralytics import YOLO
 from lane_processor import LaneProcessor
 
+import pygame  # Added for better keyboard control
 
 SERIAL_PORT = '/dev/cu.usbmodem00000000001A1' 
 BAUD_RATE = 115200
 MODEL_PATH = "best.pt"
 VIDEO_SOURCE = 0 # Webcam
+pygame.init()
+pygame.display.set_mode((100, 100)) # Small window for key focus
+pygame.display.set_caption("ROBOT_CMD")
 
 # Lane HSV range
 LOWER_YELLOW = np.array([10, 30, 60])
@@ -49,12 +54,12 @@ def main():
         if ser:
             try:
                 ser.write(msg.encode())
-            except (serial.SerialException, OSError):
-                print("⚠️ Serial disconnected. Reconnecting...")
+                ser.flush() # Ensure it's sent immediately
+            except:
                 ser = None
         else:
             try:
-                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0) # Non-blocking
                 print(f"✅ Serial reconnected.")
             except:
                 pass
@@ -82,28 +87,23 @@ def main():
         display_frame = frame.copy()
         
         if auto_mode:
-            # --- 1. Lane Processing (IMPROVED) ---
+            # --- 1. Boundary Detection (yellow color scan) ---
             roi = lane_proc.get_roi(frame)
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             mask = cv2.inRange(hsv, LOWER_YELLOW, UPPER_YELLOW)
-            # [NEW] Apply morphology to suppress crosswalk bars and noise
             mask = lane_proc.apply_morphology(mask)
-            
-            left, right, center = lane_proc.process_mask(mask)
-            heading, lateral = lane_proc.calculate_errors(center)
-            # [NEW] Get speed reduction factor for curves
-            speed_factor = lane_proc.get_speed_factor()
+            boundary_detected, fill_ratio = lane_proc.detect_boundary(mask)
             
             # --- 2. AI Processing ---
             best_det = -1 # None
             if ai_enabled:
-                # Define priority: Obstacle (8) > Red (5) > Slow (3) > Yellow (6) > others
-                # Indices based on previous mapping: {0:oneway, 1:park, 2:turn_right, 3:slow, 4:green, 5:red, 6:yellow, 7:crosswalk, 8:obstacle, 9:turn_right_marking}
-                priority_map = {8: 100, 5: 90, 1: 85, 3: 80, 0: 75, 9: 70, 6: 70, 2: 60, 7: 50} 
+                priority_map = {8: 100, 5: 90, 1: 85, 3: 80, 0: 75, 6: 70, 2: 60, 7: 50, 9: 45} 
                 current_top_priority = -1
                 
-                results = model.predict(frame, stream=True, conf=0.5, verbose=False)
-                crosswalk_count = 0
+                green_detected = False
+                cross_detected = False
+                
+                results = model.predict(frame, stream=True, conf=0.08, verbose=False) # Maximum sensitivity
                 for r in results:
                     for box in r.boxes:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -111,11 +111,20 @@ def main():
                         conf = float(box.conf[0])
                         label = r.names[cls_idx]
                         
-                        # Count crosswalks for intersection detection
-                        if cls_idx == 7:
-                            crosswalk_count += 1
+                        # --- Per-class Confidence Thresholds (Fine-Tuned Sensitivity) ---
+                        if cls_idx in [4, 6]:   thresh = 0.10  # Green, Yellow (Very sensitive)
+                        elif cls_idx == 5:    thresh = 0.50  # Red (Sensitive)
+                        elif cls_idx == 7:    thresh = 0.20  # Crosswalk (Reduced)
+                        elif cls_idx == 9:    thresh = 0.90  # T_mark (Increased to be less sensitive)
+                        else:                 thresh = 0.50  # Others
+                        
+                        if conf < thresh:
+                            continue # Skip detections that don't meet their specific threshold
+                            
+                        if cls_idx == 4: green_detected = True
+                        if cls_idx == 7: cross_detected = True
 
-                        # Get priority of this detection (default to 10 if not special)
+                        # Get priority of this detection
                         prio = priority_map.get(cls_idx, 10)
                         
                         if prio > current_top_priority:
@@ -127,22 +136,21 @@ def main():
                         cv2.putText(display_frame, f"{label} {conf:.2f}", (x1, y1-10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # Intersection Detection: 3 or 4 crosswalks
-                if crosswalk_count >= 3:
-                    # Priority of Intersection (reusing TURN_RIGHT index 2) is 60
-                    if current_top_priority < 60:
-                        current_top_priority = 60
-                        best_det = 2
-                        print(f"🚦 Intersection Detected! ({crosswalk_count} crosswalks)")
+                # --- New Interaction Logic ---
+                # 1. Turn Right Only on Crosswalk + Green Light
+                if green_detected and cross_detected:
+                    best_det = 2 # Trigger DET_TURN_RIGHT logic on STM32
+                    current_top_priority = 101 # Ensure this wins
+                
+                # 2. Ngã 3, 4 logic removed (now handled as normal detections -> DRIVE straight)
             
             # 3. Communications (Safe Write)
             safe_send(f"D:{best_det + 1}\n") # If no det, sends D:0
             if run_enabled:
-                # [IMPROVED] Send speed factor alongside lane errors
-                safe_send(f"L:{lateral:.2f},H:{heading:.2f},F:{speed_factor:.2f}\n")
+                safe_send(f"B:{1 if boundary_detected else 0}\n")
 
-            # Draw Lane Overlay
-            display_frame = lane_proc.draw_overlay(display_frame, left, right, center, heading, lateral)
+            # Draw Boundary Overlay
+            display_frame = lane_proc.draw_overlay(display_frame, boundary_detected, fill_ratio)
         else:
             # Manual Mode Overlay
             overlay = display_frame.copy()
@@ -160,9 +168,34 @@ def main():
         cv2.imshow("Robot Pilot System", display_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+        
+        # Keyboard remote control logic using PYGAME for reliable hold/release
+        if not auto_mode:
+            for event in pygame.event.get():
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_w or event.key == pygame.K_UP:
+                        safe_send("K:U\n")
+                    elif event.key == pygame.K_s or event.key == pygame.K_DOWN:
+                        safe_send("K:D\n")
+                    elif event.key == pygame.K_a or event.key == pygame.K_LEFT:
+                        safe_send("K:L\n")
+                    elif event.key == pygame.K_d or event.key == pygame.K_RIGHT:
+                        safe_send("K:R\n")
+                    elif event.key == pygame.K_SPACE:
+                        safe_send("K:S\n")
+                elif event.type == pygame.KEYUP:
+                    if event.key == pygame.K_w or event.key == pygame.K_UP:
+                        safe_send("K:u\n") # Release Up
+                    elif event.key == pygame.K_s or event.key == pygame.K_DOWN:
+                        safe_send("K:d\n") # Release Down
+                    elif event.key == pygame.K_a or event.key == pygame.K_LEFT:
+                        safe_send("K:l\n") # Release Left
+                    elif event.key == pygame.K_d or event.key == pygame.K_RIGHT:
+                        safe_send("K:r\n") # Release Right
 
     cap.release()
     cv2.destroyAllWindows()
+    pygame.quit()
     if ser: ser.close()
 
 if __name__ == "__main__":

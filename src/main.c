@@ -32,8 +32,22 @@
 #define JETSON_TIMEOUT_MS   2000
 
 /* --- State Machine Enums --- */
-typedef enum { SCREEN_MAIN_MENU=0, SCREEN_STATE, SCREEN_MOVE_MENU, SCREEN_SPEED, SCREEN_MPU, SCREEN_MPU_DATA, SCREEN_AUTO_MENU, SCREEN_AUTO_STATE } ScreenState;
-typedef enum { MOVE_AUTO=0, MOVE_LEFT, MOVE_RIGHT, MOVE_STRAIGHT, MOVE_BACK, MOVE_STOP, MOVE_PARKING } MoveMode;
+typedef enum { SCREEN_MAIN_MENU=0, SCREEN_STATE, SCREEN_MOVE_MENU, SCREEN_SPEED, SCREEN_MPU, SCREEN_MPU_DATA, SCREEN_AUTO_MENU, SCREEN_AUTO_STATE, SCREEN_MANUAL_STATE } ScreenState;
+typedef enum { MOVE_AUTO=0, MOVE_LEFT, MOVE_RIGHT, MOVE_STRAIGHT, MOVE_BACK, MOVE_STOP, MOVE_PARKING, MOVE_MANUAL } MoveMode;
+
+typedef enum {
+    MANUAL_DIR_STOP = 0,
+    MANUAL_DIR_FWD,
+    MANUAL_DIR_REV,
+    MANUAL_DIR_LEFT,
+    MANUAL_DIR_RIGHT
+} ManualDirection;
+
+static ManualDirection currentManualDir = MANUAL_DIR_STOP;
+static ManualDirection targetManualDir = MANUAL_DIR_STOP;
+static float currentManualPwm = 0.0f;
+static uint32_t manualLastTick = 0;
+static uint8_t remoteKeyUp=0, remoteKeyDown=0, remoteKeyLeft=0, remoteKeyRight=0;
 
 typedef enum {
     PARK_IDLE, PARK_FORWARD_1, PARK_TURN_R, PARK_FORWARD_2, PARK_TURN_L, PARK_DONE
@@ -50,7 +64,8 @@ typedef enum {
     AUTO_STATE_DRIVE, 
     AUTO_STATE_TURN_PENDING, AUTO_STATE_XWALK_WAIT, AUTO_STATE_TURNING,
     AUTO_STATE_PARK_PENDING, AUTO_STATE_PARK_TURN_R, AUTO_STATE_PARK_FORWARD, AUTO_STATE_PARK_TURN_L,
-    AUTO_STATE_TURN_MARK_WAIT, AUTO_STATE_TURN_MARKING
+    AUTO_STATE_TURN_MARK_WAIT, AUTO_STATE_TURN_MARKING,
+    AUTO_STATE_BOUNDARY_WAIT, AUTO_STATE_BOUNDARY_TURN  /* [NEW] Boundary detection states */
 } AutoDrivingState;
 
 /* --- Peripheral Handles --- */
@@ -82,12 +97,11 @@ static float    filteredBatVoltage = 0.0f;
 static uint8_t  displayedBatPercent = 0;
 static uint32_t lastBatUpdateTick = 0;
 
-/* Lane Centering & AI Data */
-static float lateral_error = 0.0f;
-static float heading_error = 0.0f;
-static float speed_factor = 1.0f;   /* [NEW] Curve speed reduction from Jetson (0.0-1.0) */
+/* Boundary Detection & AI Data */
 static int   left_pwm = 0, right_pwm = 0;
-static float prev_steering = 0.0f;  /* [NEW] Previous steering for rate limiting */
+static uint8_t boundary_detected = 0;       /* [NEW] From Jetson: yellow crossed scan line */
+static uint32_t boundary_wait_tick = 0;      /* [NEW] Timer for 2s straight after boundary */
+static uint32_t boundary_cooldown_tick = 0;  /* [NEW] 3s cooldown after boundary turn */
 
 static uint8_t auto_run_enabled  = 0;
 static uint8_t auto_ai_enabled   = 1;
@@ -122,7 +136,7 @@ static const char* getMoveStateText(MoveMode mode);
 
 /* Lane Centering Functions */
 uint8_t is_auto_mode_enabled(void);
-void compute_motor_pwm(float lat_err, float head_err, int *l_pwm, int *r_pwm);
+void drive_straight(int *l_pwm, int *r_pwm);
 void send_motor_command(int l_pwm, int r_pwm);
 void stop_motor(void);
 void process_lane_centering(void);
@@ -156,8 +170,6 @@ static void updateBattery(void) {
         else if (filteredBatVoltage >= BAT_MAX_VOLTAGE) newPercent = 100;
         else newPercent = (uint8_t)((filteredBatVoltage - BAT_MIN_VOLTAGE) / (BAT_MAX_VOLTAGE - BAT_MIN_VOLTAGE) * 100.0f);
         if (abs((int)newPercent - (int)displayedBatPercent) >= BAT_PERCENT_HYSTERESIS) displayedBatPercent = newPercent;
-        int iv = (int)filteredBatVoltage; int fv = (int)((filteredBatVoltage - iv) * 100);
-        printf("BATTERY, filtered=%d.%02dV, percent=%d%%\r\n", iv, fv, displayedBatPercent);
     }
 }
 
@@ -169,7 +181,8 @@ static const char* getMoveStateText(MoveMode mode) {
         case MOVE_STRAIGHT: return "STRAIGHT"; case MOVE_LEFT: return "LEFT";
         case MOVE_RIGHT: return "RIGHT";       case MOVE_BACK: return "BACK";
         case MOVE_STOP: return "STOP";         case MOVE_PARKING: return "PARKING";
-        case MOVE_AUTO: return "AUTO";         default: return "UNKNOWN";
+        case MOVE_AUTO: return "AUTO";         case MOVE_MANUAL: return "MANUAL";
+        default: return "UNKNOWN";
     }
 }
 
@@ -183,10 +196,21 @@ static void applyMoveMode(void) {
     if (currentMove == MOVE_PARKING) { parkState = PARK_FORWARD_1; LED_YELLOW(); }
     else if (currentMove == MOVE_AUTO) {
         parkState = PARK_IDLE; isTurning = 0;
-        lateral_error = 0.0f; heading_error = 0.0f;
+        boundary_detected = 0; boundary_wait_tick = 0; boundary_cooldown_tick = 0;
         LED_GREEN(); // Auto mode indicator
         currentScreen = SCREEN_AUTO_MENU; // Change to submenu config
         menuIndex = 0; needRedraw = 1;
+    }
+    else if (currentMove == MOVE_MANUAL) {
+        parkState = PARK_IDLE; isTurning = 0;
+        LED_YELLOW();
+        currentScreen = SCREEN_MANUAL_STATE;
+        currentManualDir = MANUAL_DIR_STOP;
+        targetManualDir = MANUAL_DIR_STOP;
+        currentManualPwm = 0.0f;
+        manualLastTick = HAL_GetTick();
+        Motor_Stop();
+        needRedraw = 1;
     }
     else {
         parkState = PARK_IDLE; isTurning = 0;
@@ -196,6 +220,71 @@ static void applyMoveMode(void) {
             case MOVE_LEFT: Motor_TurnLeft(speedValue); break; case MOVE_RIGHT: Motor_TurnRight(speedValue); break;
             case MOVE_STRAIGHT: Motor_Forward(speedValue); break; case MOVE_BACK: Motor_Backward(speedValue); break;
             case MOVE_STOP: Motor_Stop(); break; default: break;
+        }
+    }
+}
+
+static void updateManualControl(void) {
+    // Exit manual mode when BACK button is pressed (from STM32 buttons)
+    if (btnBack.pressed) {
+        Motor_Stop();
+        currentManualPwm = 0.0f;
+        currentManualDir = MANUAL_DIR_STOP;
+        remoteKeyUp=0; remoteKeyDown=0; remoteKeyLeft=0; remoteKeyRight=0;
+        currentMove = MOVE_STOP;
+        currentScreen = SCREEN_MAIN_MENU;
+        needRedraw = 1;
+        return;
+    }
+
+    targetManualDir = MANUAL_DIR_STOP;
+    if (remoteKeyUp)      targetManualDir = MANUAL_DIR_FWD;
+    else if (remoteKeyDown)  targetManualDir = MANUAL_DIR_REV;
+    else if (remoteKeyLeft)  targetManualDir = MANUAL_DIR_LEFT;
+    else if (remoteKeyRight) targetManualDir = MANUAL_DIR_RIGHT;
+    
+    uint32_t now = HAL_GetTick();
+    uint32_t dt_ms = now - manualLastTick;
+    manualLastTick = now;
+    if (dt_ms > 100) dt_ms = 100;
+    
+    // Smooth speed ramp params
+    float ramp_step = (255.0f / 150.0f) * dt_ms; // Acceleration: 150ms from 0 to 255 (faster)
+    float down_step = (255.0f / 100.0f) * dt_ms; // Deceleration: 100ms from 255 to 0 (faster)
+
+    if (targetManualDir != currentManualDir && currentManualDir != MANUAL_DIR_STOP) {
+        // Must stop or reduce to 0 first!
+        currentManualPwm -= down_step;
+        if (currentManualPwm <= 0) {
+            currentManualPwm = 0;
+            currentManualDir = MANUAL_DIR_STOP;
+            Motor_Stop();
+        }
+    } else {
+        // Change to target direction and ramp up
+        currentManualDir = targetManualDir;
+        if (currentManualDir == MANUAL_DIR_STOP) {
+            currentManualPwm -= down_step;
+            if (currentManualPwm <= 0) {
+                currentManualPwm = 0;
+                Motor_Stop();
+            }
+        } else {
+            // Accelerate
+            currentManualPwm += ramp_step;
+            if (currentManualPwm > speedValue) currentManualPwm = speedValue;
+        }
+    }
+
+    // Apply motor PWM
+    if (currentManualDir != MANUAL_DIR_STOP && currentManualPwm > 0) {
+        uint8_t pwm = (uint8_t)currentManualPwm;
+        switch (currentManualDir) {
+            case MANUAL_DIR_FWD: Motor_Forward(pwm); break;
+            case MANUAL_DIR_REV: Motor_Backward(pwm); break;
+            case MANUAL_DIR_LEFT: Motor_TurnLeft(pwm); break;
+            case MANUAL_DIR_RIGHT: Motor_TurnRight(pwm); break;
+            default: Motor_Stop(); break;
         }
     }
 }
@@ -247,24 +336,23 @@ static void updateUI(void) {
       currentScreen != SCREEN_MPU_DATA && 
       currentScreen != SCREEN_STATE &&
       currentScreen != SCREEN_AUTO_MENU &&
-      currentScreen != SCREEN_AUTO_STATE) return;
+      currentScreen != SCREEN_AUTO_STATE &&
+      currentScreen != SCREEN_MANUAL_STATE) return;
   needRedraw = 0; SSD1306_Clear(); char buf[32], f[16]; const MPU6050_Data_t *mpu = MPU6050_GetData();
   switch (currentScreen) {
     case SCREEN_MAIN_MENU:
       SSD1306_WriteStringInverted(0, 0, "   MAIN MENU    ");
-      const char *items[] = {"STATE", "MOVE", "SPEED", "MPU"};
-      for (int i=0; i<4; i++) {
+      const char *items[] = {"STATE", "MANUAL", "MOVE", "SPEED", "MPU"};
+      for (int i=0; i<5; i++) {
         snprintf(buf, sizeof(buf), "%s %s", (i==menuIndex)?">":" ", items[i]);
-        if(i==menuIndex) SSD1306_WriteStringInverted(0, (i+2), buf); else SSD1306_WriteString(0, (i+2), buf);
+        if(i==menuIndex) SSD1306_WriteStringInverted(0, (i+1), buf); else SSD1306_WriteString(0, (i+1), buf);
       }
       break;
     case SCREEN_STATE:
       SSD1306_WriteStringInverted(0, 0, "     STATE      ");
       snprintf(buf, sizeof(buf), "Move : %-10s", getMoveStateText(currentMove)); SSD1306_WriteString(0, 2, buf);
       if (currentMove == MOVE_AUTO) {
-          char f2[16];
-          fmt_float1(f, lateral_error); fmt_float1(f2, heading_error);
-          snprintf(buf, sizeof(buf), "L:%s H:%s", f, f2); SSD1306_WriteString(0, 4, buf);
+          snprintf(buf, sizeof(buf), "BOUND: %-8s", boundary_detected ? "DETECT" : "CLEAR"); SSD1306_WriteString(0, 4, buf);
           snprintf(buf, sizeof(buf), "PWM: L%d R%d", left_pwm, right_pwm); SSD1306_WriteString(0, 5, buf);
           snprintf(buf, sizeof(buf), "JETSON: %-5s", jetsonConnected ? "OK" : "MISS"); SSD1306_WriteString(0, 7, buf);
       } else {
@@ -314,10 +402,32 @@ static void updateUI(void) {
       SSD1306_WriteStringInverted(0, 0, "   AUTO STATE   ");
       snprintf(buf, sizeof(buf), "Run:%s AI:%s L:%s", auto_run_enabled?"ON":"OF", auto_ai_enabled?"ON":"OF", auto_lane_enabled?"ON":"OF"); 
       SSD1306_WriteString(0, 1, buf);
-      const char* w_txt[] = {"CENTERED", "SHFT LEFT", "SHFT RIGHT"};
-      snprintf(buf, sizeof(buf), "WHEEL: %s", w_txt[(int)wheel_state]); SSD1306_WriteString(0, 3, buf);
+      snprintf(buf, sizeof(buf), "BOUND: %s", boundary_detected ? "DETECT" : "CLEAR"); SSD1306_WriteString(0, 3, buf);
       snprintf(buf, sizeof(buf), "DET  : %s", getDetectText(detect_state)); SSD1306_WriteString(0, 5, buf);
       snprintf(buf, sizeof(buf), "PWM  : L%d R%d", left_pwm, right_pwm); SSD1306_WriteString(0, 7, buf);
+      break;
+    case SCREEN_MANUAL_STATE:
+      SSD1306_WriteStringInverted(0, 0, "  MANUAL MODE   ");
+      SSD1306_WriteString(0, 1, "Src : SERIAL KB");
+      
+      snprintf(buf, sizeof(buf), "Cmd : %-5s", 
+               targetManualDir == MANUAL_DIR_FWD ? "UP" : 
+               targetManualDir == MANUAL_DIR_REV ? "DOWN" : 
+               targetManualDir == MANUAL_DIR_LEFT ? "LEFT" : 
+               targetManualDir == MANUAL_DIR_RIGHT ? "RIGHT" : "STOP");
+      SSD1306_WriteString(0, 2, buf);
+      
+      snprintf(buf, sizeof(buf), "Dir : %-5s", 
+               currentManualDir == MANUAL_DIR_FWD ? "FWD" : 
+               currentManualDir == MANUAL_DIR_REV ? "REV" : 
+               currentManualDir == MANUAL_DIR_LEFT ? "LEFT" : 
+               currentManualDir == MANUAL_DIR_RIGHT ? "RIGHT" : "STOP");
+      SSD1306_WriteString(0, 3, buf);
+      
+      snprintf(buf, sizeof(buf), "PWM : %3d /%3d", (int)currentManualPwm, speedValue);
+      SSD1306_WriteString(0, 5, buf);
+      
+      SSD1306_WriteStringInverted(0, 7, "BTN BACK to MENU");
       break;
     default: break;
   }
@@ -350,7 +460,7 @@ int main(void) {
         static uint32_t lastLogTick = 0;
         if (HAL_GetTick() - lastLogTick > 100) {
             lastLogTick = HAL_GetTick();
-            // Prefix S: [ModeIdx],[Run],[AI],[Lane]
+            // Essential for Python script to know the current mode (MOVE_MANUAL is 7)
             printf("S:%d,%d,%d,%d\n", (int)currentMove, (int)auto_run_enabled, (int)auto_ai_enabled, (int)auto_lane_enabled);
         }
 
@@ -362,18 +472,29 @@ int main(void) {
         }
         updateParkingMode();
 
+        if (currentScreen == SCREEN_MANUAL_STATE) {
+            updateManualControl();
+        }
+
         switch (currentScreen) {
           case SCREEN_MAIN_MENU: 
-            if (btnUp.pressed) { menuIndex = (menuIndex <= 0) ? 3 : menuIndex - 1; needRedraw = 1; }
-            if (btnDown.pressed) { menuIndex = (menuIndex >= 3) ? 0 : menuIndex + 1; needRedraw = 1; }
-            if (btnSelect.pressed) { currentScreen = (ScreenState)(menuIndex==0?1:(menuIndex==1?2:(menuIndex==2?3:4))); menuIndex=0; needRedraw=1; }
+            if (btnUp.pressed) { menuIndex = (menuIndex <= 0) ? 4 : menuIndex - 1; needRedraw = 1; }
+            if (btnDown.pressed) { menuIndex = (menuIndex >= 4) ? 0 : menuIndex + 1; needRedraw = 1; }
+            if (btnSelect.pressed) { 
+                if (menuIndex == 0) currentScreen = SCREEN_STATE;
+                else if (menuIndex == 1) { currentMove = MOVE_MANUAL; applyMoveMode(); }
+                else if (menuIndex == 2) currentScreen = SCREEN_MOVE_MENU;
+                else if (menuIndex == 3) currentScreen = SCREEN_SPEED;
+                else if (menuIndex == 4) currentScreen = SCREEN_MPU;
+                menuIndex = 0; needRedraw = 1; 
+            }
             break;
           case SCREEN_MOVE_MENU:
             if (btnUp.pressed) { menuIndex = (menuIndex <= 0) ? 6 : menuIndex - 1; needRedraw = 1; }
             if (btnDown.pressed) { menuIndex = (menuIndex >= 6) ? 0 : menuIndex + 1; needRedraw = 1; }
             if (btnSelect.pressed) { 
                 currentMove = (MoveMode)menuIndex; 
-                applyMoveMode(); // This will set currentScreen correctly for AUTO or others
+                applyMoveMode(); 
                 needRedraw = 1; 
             }
             if (btnBack.pressed) { currentScreen = SCREEN_MAIN_MENU; LED_OFF(); needRedraw = 1; }
@@ -416,6 +537,11 @@ int main(void) {
             break;
           case SCREEN_MPU_DATA:
             if (btnBack.pressed) { currentScreen = SCREEN_MPU; needRedraw = 1; }
+            break;
+          case SCREEN_MANUAL_STATE:
+            // Do not react to normal btn.pressed events to avoid exiting unintentionally
+            // Exiting is handled by holding UP+DOWN in updateManualControl
+            btnBack.pressed = 0; btnUp.pressed = 0; btnDown.pressed = 0; btnSelect.pressed = 0;
             break;
           default: if (btnBack.pressed) { currentScreen = SCREEN_MAIN_MENU; needRedraw = 1; } break;
         }
@@ -482,47 +608,15 @@ void send_motor_command(int l_pwm, int r_pwm) {
     Motor_Set_Speed((int16_t)l_pwm, (int16_t)r_pwm);
 }
 
-void compute_motor_pwm(float lat_err, float head_err, int *l_pwm, int *r_pwm) {
+/* [SIMPLIFIED] No lane centering – car drives straight by default */
+void drive_straight(int *l_pwm, int *r_pwm) {
     float base_pwm = (float)speedValue;
-    if (detect_state == DET_SLOW_DOWN) base_pwm *= 0.5f; // Reduce to 50%
-    
-    /* [NEW] Apply curve speed reduction from Jetson */
-    base_pwm *= speed_factor;
-    
-    // Safety check: if lane centering is disabled, just drive straight
-    if (!auto_lane_enabled) {
-        *l_pwm = (int)base_pwm;
-        *r_pwm = (int)base_pwm;
-        wheel_state = WHEEL_CENTER;
-        return;
+    if (detect_state == DET_SLOW_DOWN || detect_state == DET_YELLOW_LIGHT) {
+        base_pwm *= 0.5f; // Reduce speed to 50%
     }
-
-    /* [IMPROVED] PD-control for lane centering with rate limiting
-     * TODO: Tune kp_lat, kp_head, kd_steer, max_steer_delta */
-    float kp_lat  = 0.6f;     /* TODO: Tune - lateral P gain (was 0.8) */
-    float kp_head = 2.0f;     /* TODO: Tune - heading P gain (was 30.0, now normalized) */
-    float kd_steer = 0.15f;   /* TODO: Tune - derivative damping on steering output */
-    float max_steer_delta = 8.0f; /* TODO: Tune - max steering change per cycle */
-    
-    float raw_steering = (lat_err * kp_lat) + (head_err * kp_head);
-    
-    /* [NEW] Rate limiting: prevent sudden steering jumps */
-    float steer_delta = raw_steering - prev_steering;
-    if (steer_delta >  max_steer_delta) steer_delta =  max_steer_delta;
-    if (steer_delta < -max_steer_delta) steer_delta = -max_steer_delta;
-    float steering = prev_steering + steer_delta;
-    
-    /* [NEW] Derivative damping: oppose rapid changes */
-    steering -= kd_steer * steer_delta;
-    prev_steering = steering;
-    
-    *l_pwm = (int)(base_pwm + steering);
-    *r_pwm = (int)(base_pwm - steering);
-
-    // Update wheel status display based on error
-    if (lat_err > 20) wheel_state = WHEEL_RIGHT;
-    else if (lat_err < -20) wheel_state = WHEEL_LEFT;
-    else wheel_state = WHEEL_CENTER;
+    *l_pwm = (int)base_pwm;
+    *r_pwm = (int)base_pwm;
+    wheel_state = WHEEL_CENTER;
 }
 
 void process_lane_centering(void) {
@@ -593,7 +687,7 @@ void process_lane_centering(void) {
                     auto_driving_state = AUTO_STATE_XWALK_WAIT;
                     xwalk_exit_tick = HAL_GetTick(); // Keep resetting
                 } 
-                else if (HAL_GetTick() - xwalk_exit_tick > 2000) {
+                else if (HAL_GetTick() - xwalk_exit_tick > 3000) {
                     // This case is if we triggered TURN_RIGHT but never saw CROSSWALK 
                     // and then nothing happens for 2s. 
                     startTurnRelative(90.0f);
@@ -609,8 +703,8 @@ void process_lane_centering(void) {
                 else if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
                     xwalk_exit_tick = HAL_GetTick(); // Still in crossing/intersection zone
                 } 
-                else if (HAL_GetTick() - xwalk_exit_tick > 2000) {
-                    // All clear for 2 seconds
+                else if (HAL_GetTick() - xwalk_exit_tick > 3000) {
+                    // All clear for 3 seconds
                     startTurnRelative(90.0f);
                     auto_driving_state = AUTO_STATE_TURNING;
                     return;
@@ -687,39 +781,65 @@ void process_lane_centering(void) {
         auto_driving_state = AUTO_STATE_DRIVE;
     }
 
-    // 4. Normal Lane Centering (if not turning)
-    compute_motor_pwm(lateral_error, heading_error, &left_pwm, &right_pwm);
+    // 4. Boundary Detection – replaces lane centering
+    //    When yellow border crosses scan line → straight 2s → turn right → straight
+    if (auto_lane_enabled && auto_driving_state == AUTO_STATE_DRIVE) {
+        uint8_t cooled = (boundary_cooldown_tick == 0 || 
+                          (HAL_GetTick() - boundary_cooldown_tick > 3000));
+        if (boundary_detected && cooled) {
+            auto_driving_state = AUTO_STATE_BOUNDARY_WAIT;
+            boundary_wait_tick = HAL_GetTick();
+        }
+    }
+
+    if (auto_driving_state == AUTO_STATE_BOUNDARY_WAIT) {
+        // Continue straight for 2 seconds after boundary detected
+        if (HAL_GetTick() - boundary_wait_tick > 3000) {
+            startTurnRelative(90.0f); // Turn right 90 degrees
+            auto_driving_state = AUTO_STATE_BOUNDARY_TURN;
+            return;
+        }
+        // Fall through to drive straight below
+    }
+    else if (auto_driving_state == AUTO_STATE_BOUNDARY_TURN) {
+        if (updateTurnController()) {
+            auto_driving_state = AUTO_STATE_DRIVE;
+            boundary_cooldown_tick = HAL_GetTick(); // 3s cooldown to prevent re-trigger
+        }
+        return; // Turn controller handles motors
+    }
+
+    // 5. Default: drive straight
+    drive_straight(&left_pwm, &right_pwm);
     send_motor_command(left_pwm, right_pwm);
 }
 
 /**
- * Expected format: "L:1.23,H:4.56" or similar.
- * Let's assume CSV: "LAT,HEAD"
+ * Parse serial data from Jetson.
+ * Expected formats: "B:0" or "B:1" (boundary), "D:idx" (detection)
  */
 void Process_Serial_Data(char *data, uint32_t len) {
-    // Expected formats: 
-    // "L:val,H:val,F:val" -> Lane errors + speed factor
-    // "D:idx" -> Detection index
-    
-    char *l_ptr = strstr(data, "L:");
-    char *h_ptr = strstr(data, "H:");
     char *d_ptr = strstr(data, "D:");
-    char *f_ptr = strstr(data, "F:"); /* [NEW] Speed factor */
+    char *b_ptr = strstr(data, "B:");
     
-    if (l_ptr && h_ptr) {
-        lateral_error = atof(l_ptr + 2);
-        heading_error = atof(h_ptr + 2);
-        lastJetsonRxTick = HAL_GetTick(); 
-    }
-    
-    /* [NEW] Parse speed factor from Jetson */
-    if (f_ptr) {
-        float f_val = atof(f_ptr + 2);
-        if (f_val >= 0.0f && f_val <= 1.0f) speed_factor = f_val;
+    if (b_ptr) {
+        boundary_detected = (uint8_t)atoi(b_ptr + 2);
+        lastJetsonRxTick = HAL_GetTick();
     }
     
     if (d_ptr) {
         detect_state = (DetectState)atoi(d_ptr + 2);
+        lastJetsonRxTick = HAL_GetTick();
+    }
+    
+    char *k_ptr = strstr(data, "K:");
+    if (k_ptr) {
+        char cmd = k_ptr[2];
+        if (cmd == 'U') remoteKeyUp = 1; else if (cmd == 'u') remoteKeyUp = 0;
+        if (cmd == 'D') remoteKeyDown = 1; else if (cmd == 'd') remoteKeyDown = 0;
+        if (cmd == 'L') remoteKeyLeft = 1; else if (cmd == 'l') remoteKeyLeft = 0;
+        if (cmd == 'R') remoteKeyRight = 1; else if (cmd == 'r') remoteKeyRight = 0;
+        if (cmd == 'S') { remoteKeyUp=0; remoteKeyDown=0; remoteKeyLeft=0; remoteKeyRight=0; }
         lastJetsonRxTick = HAL_GetTick();
     }
 }
