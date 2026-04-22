@@ -59,12 +59,12 @@ typedef enum {
     DET_GREEN_LIGHT, DET_RED_LIGHT, DET_YELLOW_LIGHT, DET_CROSSWALK, DET_OBSTACLE,
     DET_TURN_RIGHT_MARKING 
 } DetectState;
-
-typedef enum { 
+typedef enum {
     AUTO_STATE_DRIVE, 
-    AUTO_STATE_TURN_PENDING, AUTO_STATE_XWALK_WAIT, AUTO_STATE_TURNING,
+    AUTO_STATE_TURN_PENDING, AUTO_STATE_SIGN_WAIT, AUTO_STATE_TURNING,
     AUTO_STATE_PARK_PENDING, AUTO_STATE_PARK_TURN_R, AUTO_STATE_PARK_FORWARD, AUTO_STATE_PARK_TURN_L,
     AUTO_STATE_TURN_MARK_WAIT, AUTO_STATE_TURN_MARKING,
+    AUTO_STATE_GREEN_WAIT,
     AUTO_STATE_BOUNDARY_WAIT, AUTO_STATE_BOUNDARY_TURN  /* [NEW] Boundary detection states */
 } AutoDrivingState;
 
@@ -109,9 +109,10 @@ static uint8_t auto_lane_enabled = 1;
 static WheelState  wheel_state   = WHEEL_CENTER;
 static DetectState detect_state  = DET_NONE;
 static AutoDrivingState auto_driving_state = AUTO_STATE_DRIVE;
-static uint32_t xwalk_exit_tick = 0; // Timer for crosswalk clearance
+static uint32_t xwalk_exit_tick = 0; // Timer for sign/crosswalk clearance
 static uint32_t oneway_lock_tick = 0; // Timer for one-way sign lockout (5s)
 static uint32_t turn_mark_exit_tick = 0; // Timer for turn marking disappearance (3s)
+static uint32_t green_exit_tick = 0; // [NEW] Timer for green light disappearance (5s)
 
 typedef struct { uint8_t last, pressed; uint16_t holdCounter; } Button_t;
 static Button_t btnUp, btnDown, btnSelect, btnBack;
@@ -289,7 +290,10 @@ static void updateManualControl(void) {
     }
 }
 
-static void startTurnRelative(float delta) { targetYaw = MPU6050_GetData()->yaw + delta; isTurning = 1; }
+static void startTurnRelative(float delta) { 
+    targetYaw += delta; // Increment target heading (e.g., 0 -> 90 -> 180)
+    isTurning = 1; 
+}
 
 static uint8_t updateTurnController(void) {
     float error = targetYaw - MPU6050_GetData()->yaw;
@@ -402,9 +406,9 @@ static void updateUI(void) {
       SSD1306_WriteStringInverted(0, 0, "   AUTO STATE   ");
       snprintf(buf, sizeof(buf), "Run:%s AI:%s L:%s", auto_run_enabled?"ON":"OF", auto_ai_enabled?"ON":"OF", auto_lane_enabled?"ON":"OF"); 
       SSD1306_WriteString(0, 1, buf);
-      snprintf(buf, sizeof(buf), "BOUND: %s", boundary_detected ? "DETECT" : "CLEAR"); SSD1306_WriteString(0, 3, buf);
+      fmt_float1(f, mpu->yaw); snprintf(buf, sizeof(buf), "Angle: %s deg", f); SSD1306_WriteString(0, 3, buf);
       snprintf(buf, sizeof(buf), "DET  : %s", getDetectText(detect_state)); SSD1306_WriteString(0, 5, buf);
-      snprintf(buf, sizeof(buf), "PWM  : L%d R%d", left_pwm, right_pwm); SSD1306_WriteString(0, 7, buf);
+      SSD1306_WriteString(0, 7, "> BTN SEL: RESET"); 
       break;
     case SCREEN_MANUAL_STATE:
       SSD1306_WriteStringInverted(0, 0, "  MANUAL MODE   ");
@@ -517,6 +521,7 @@ int main(void) {
             if (btnBack.pressed) { currentScreen = SCREEN_MOVE_MENU; needRedraw = 1; }
             break;
           case SCREEN_AUTO_STATE:
+            if (btnSelect.pressed) { MPU6050_ResetYaw(); targetYaw = 0; needRedraw = 1; }
             if (btnBack.pressed) { currentScreen = SCREEN_AUTO_MENU; needRedraw = 1; }
             break;
           case SCREEN_MPU:
@@ -524,7 +529,7 @@ int main(void) {
             if (btnDown.pressed) { menuIndex = (menuIndex >= 2) ? 0 : menuIndex + 1; needRedraw = 1; }
             if (btnSelect.pressed) {
                 if (menuIndex == 0) { currentScreen = SCREEN_MPU_DATA; }
-                else if (menuIndex == 1) { MPU6050_ResetYaw(); }
+                else if (menuIndex == 1) { MPU6050_ResetYaw(); targetYaw = 0; }
                 else if (menuIndex == 2) { 
                     SSD1306_Clear();
                     SSD1306_WriteString(0, 3, " CALIBRATING...");
@@ -614,9 +619,23 @@ void drive_straight(int *l_pwm, int *r_pwm) {
     if (detect_state == DET_SLOW_DOWN || detect_state == DET_YELLOW_LIGHT) {
         base_pwm *= 0.5f; // Reduce speed to 50%
     }
-    *l_pwm = (int)base_pwm;
-    *r_pwm = (int)base_pwm;
-    wheel_state = WHEEL_CENTER;
+
+    /* --- Heading Keep Logic [REFINED] --- */
+    // Use the global targetYaw which only changes on turn commands
+    float currentYaw = MPU6050_GetData()->yaw;
+    float error = targetYaw - currentYaw;
+
+    // P-Controller: Adjust motor speeds based on heading error
+    float kp = 2.5f; // Sensitivity of correction
+    int correction = (int)(error * kp);
+
+    *l_pwm = (int)base_pwm + correction;
+    *r_pwm = (int)base_pwm - correction;
+
+    // Update wheel state for UI indication
+    if (correction > 5)       wheel_state = WHEEL_LEFT;
+    else if (correction < -5) wheel_state = WHEEL_RIGHT;
+    else                      wheel_state = WHEEL_CENTER;
 }
 
 void process_lane_centering(void) {
@@ -668,10 +687,14 @@ void process_lane_centering(void) {
                 }
                 else if (detect_state == DET_TURN_RIGHT) {
                     auto_driving_state = AUTO_STATE_TURN_PENDING;
-                    xwalk_exit_tick = HAL_GetTick(); // Start 2s countdown
+                    xwalk_exit_tick = HAL_GetTick(); // Start countdown
                 }
                 else if (detect_state == DET_TURN_RIGHT_MARKING) {
                     auto_driving_state = AUTO_STATE_TURN_MARK_WAIT;
+                }
+                else if (detect_state == DET_GREEN_LIGHT) {
+                    auto_driving_state = AUTO_STATE_GREEN_WAIT;
+                    green_exit_tick = 0;
                 }
                 else if (detect_state == DET_PARK) {
                     auto_driving_state = AUTO_STATE_PARK_PENDING;
@@ -680,31 +703,29 @@ void process_lane_centering(void) {
 
             case AUTO_STATE_TURN_PENDING:
                 if (in_oneway_lock) {
-                    auto_driving_state = AUTO_STATE_DRIVE; // Abort turn if one-way sign appears
+                    auto_driving_state = AUTO_STATE_DRIVE;
                 }
-                // Intersection triggered. Wait until no more intersection/crosswalk seen.
-                else if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
-                    auto_driving_state = AUTO_STATE_XWALK_WAIT;
+                // Sign triggered. Wait until it disappears.
+                else if (detect_state == DET_TURN_RIGHT) {
+                    auto_driving_state = AUTO_STATE_SIGN_WAIT;
                     xwalk_exit_tick = HAL_GetTick(); // Keep resetting
                 } 
-                else if (HAL_GetTick() - xwalk_exit_tick > 3000) {
-                    // This case is if we triggered TURN_RIGHT but never saw CROSSWALK 
-                    // and then nothing happens for 2s. 
+                else if (HAL_GetTick() - xwalk_exit_tick > 7000) {
                     startTurnRelative(90.0f);
                     auto_driving_state = AUTO_STATE_TURNING;
                     return;
                 }
                 break;
 
-            case AUTO_STATE_XWALK_WAIT:
+            case AUTO_STATE_SIGN_WAIT:
                 if (in_oneway_lock) {
-                    auto_driving_state = AUTO_STATE_DRIVE; // Abort turn if one-way sign appears
+                    auto_driving_state = AUTO_STATE_DRIVE;
                 }
-                else if (detect_state == DET_CROSSWALK || detect_state == DET_TURN_RIGHT) {
-                    xwalk_exit_tick = HAL_GetTick(); // Still in crossing/intersection zone
+                else if (detect_state == DET_TURN_RIGHT) {
+                    xwalk_exit_tick = HAL_GetTick(); // Still seeing it
                 } 
-                else if (HAL_GetTick() - xwalk_exit_tick > 3000) {
-                    // All clear for 3 seconds
+                else if (HAL_GetTick() - xwalk_exit_tick > 5000) {
+                    // Sign gone for 5 seconds
                     startTurnRelative(90.0f);
                     auto_driving_state = AUTO_STATE_TURNING;
                     return;
@@ -761,7 +782,7 @@ void process_lane_centering(void) {
                 } else {
                     // Sign disappeared! Start 3s countdown
                     if (turn_mark_exit_tick == 0) turn_mark_exit_tick = HAL_GetTick();
-                    if (HAL_GetTick() - turn_mark_exit_tick > 3000) {
+                    if (HAL_GetTick() - turn_mark_exit_tick > 6500) {
                         startTurnRelative(90.0f);
                         auto_driving_state = AUTO_STATE_TURN_MARKING;
                         return;
@@ -774,6 +795,19 @@ void process_lane_centering(void) {
                     auto_driving_state = AUTO_STATE_DRIVE;
                 }
                 return;
+
+            case AUTO_STATE_GREEN_WAIT:
+                if (detect_state == DET_GREEN_LIGHT) {
+                    green_exit_tick = 0; // Reset while still seeing it
+                } else {
+                    if (green_exit_tick == 0) green_exit_tick = HAL_GetTick();
+                    if (HAL_GetTick() - green_exit_tick > 6000) { // 7s after disappearance
+                        startTurnRelative(90.0f);
+                        auto_driving_state = AUTO_STATE_TURNING;
+                        return;
+                    }
+                }
+                break;
 
             default: break;
         }

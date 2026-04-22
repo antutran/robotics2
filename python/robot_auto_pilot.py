@@ -10,7 +10,7 @@ import pygame  # Added for better keyboard control
 
 SERIAL_PORT = '/dev/cu.usbmodem00000000001A1' 
 BAUD_RATE = 115200
-MODEL_PATH = "best.pt"
+MODEL_PATH = "best2.pt"
 VIDEO_SOURCE = 0 # Webcam
 pygame.init()
 pygame.display.set_mode((100, 100)) # Small window for key focus
@@ -97,11 +97,12 @@ def main():
             # --- 2. AI Processing ---
             best_det = -1 # None
             if ai_enabled:
-                priority_map = {8: 100, 5: 90, 1: 85, 3: 80, 0: 75, 6: 70, 2: 60, 7: 50, 9: 45} 
+                # Added 4 (Green Light) to priority map to ensure it's sent to STM32
+                priority_map = {8: 100, 5: 90, 4: 88, 1: 85, 3: 80, 0: 75, 6: 70, 2: 60, 7: 50, 9: 45} 
                 current_top_priority = -1
                 
                 green_detected = False
-                cross_detected = False
+                # cross_detected logic removed
                 
                 results = model.predict(frame, stream=True, conf=0.08, verbose=False) # Maximum sensitivity
                 for r in results:
@@ -122,7 +123,6 @@ def main():
                             continue # Skip detections that don't meet their specific threshold
                             
                         if cls_idx == 4: green_detected = True
-                        if cls_idx == 7: cross_detected = True
 
                         # Get priority of this detection
                         prio = priority_map.get(cls_idx, 10)
@@ -136,13 +136,8 @@ def main():
                         cv2.putText(display_frame, f"{label} {conf:.2f}", (x1, y1-10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
-                # --- New Interaction Logic ---
-                # 1. Turn Right Only on Crosswalk + Green Light
-                if green_detected and cross_detected:
-                    best_det = 2 # Trigger DET_TURN_RIGHT logic on STM32
-                    current_top_priority = 101 # Ensure this wins
-                
-                # 2. Ngã 3, 4 logic removed (now handled as normal detections -> DRIVE straight)
+                # 1. Turn Right Mission logic removed from Python (now handled by Green Light disappearance on STM32)
+                # 2. Ngã 3, 4 logic removed
             
             # 3. Communications (Safe Write)
             safe_send(f"D:{best_det + 1}\n") # If no det, sends D:0

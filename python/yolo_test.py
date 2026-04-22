@@ -4,7 +4,7 @@ from ultralytics import YOLO
 
 # ===== CONFIGURATION =====
 # Path to your YOLO model
-MODEL_PATH = "best.pt"
+MODEL_PATH = "best1.pt"
 
 # Webcam settings
 CAM_WIDTH = 640
@@ -12,9 +12,9 @@ CAM_HEIGHT = 480
 
 # Class names in your model (for reference)
 class_names = [
-    "turn_right", "crosswalk", "park", "slow_down", 
-    "yellow_light", "red_light", "green_light", 
-    "one_way", "obstacle"
+    "one_way", "park", "turn_right", "slow_down", 
+    "green_light", "red_light", "yellow_light", 
+    "crosswalk", "obstacle", "rightarrow"
 ]
 
 def main():
